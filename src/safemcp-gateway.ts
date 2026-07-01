@@ -3,8 +3,8 @@ import * as readline from 'node:readline';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { URL } from 'node:url';
+import { createHash } from 'node:crypto'; // Added for proper SHA-256 auditing
 
-// Unified configuration schema for security policy enforcement
 interface GatewayConfig {
   allowedRoots: string[];
   allowedCommands: string[];
@@ -31,7 +31,6 @@ const DEFAULT_CONFIG: GatewayConfig = {
   }
 };
 
-// Application-level policy enforcement engine
 class SecurityEngine {
   private config: GatewayConfig;
 
@@ -39,39 +38,38 @@ class SecurityEngine {
     this.config = config;
   }
 
-  // Detects and blocks directory traversal sequences
+  // [FIXED] Detects directory traversal sequences and forces absolute path resolution
   public validatePath(inputPath: string): boolean {
     try {
-      const decoded = decodeURIComponent(inputPath);
+      // Clean 'file://' prefix if the AI provides a URI instead of a raw path
+      const strippedPath = inputPath.replace(/^file:\/\//i, '');
+      const decoded = decodeURIComponent(strippedPath);
       
-      // Look for encoded traversal sequences and null-byte injection vectors
-      if (
-        decoded.includes('..') ||
-        decoded.includes('%2e%2e') ||
-        decoded.includes('/') ||
-        decoded.includes('\\') ||
-        decoded.includes('\x00') ||
-        decoded.includes('%00')
-      ) {
-        // Run deep structural resolution if the parameter is a valid local path
-        const resolvedPath = path.resolve(decoded);
-        const isWithinAllowedRoot = this.config.allowedRoots.some((root) => {
-          const absoluteRoot = path.resolve(root);
-          const relative = path.relative(absoluteRoot, resolvedPath);
-          return !relative.startsWith('..') && !path.isAbsolute(relative);
-        });
-
-        return isWithinAllowedRoot;
+      // Block null-byte injection vectors immediately
+      if (decoded.includes('\x00')) {
+        return false;
       }
+
+      // We now ALWAYS resolve the path regardless of what characters are in it.
+      // This patches the sandbox escape via plain filenames.
+      const resolvedPath = path.resolve(decoded);
+      
+      const isWithinAllowedRoot = this.config.allowedRoots.some((root) => {
+        const absoluteRoot = path.resolve(root);
+        const relative = path.relative(absoluteRoot, resolvedPath);
+        return !relative.startsWith('..') && !path.isAbsolute(relative);
+      });
+
+      return isWithinAllowedRoot;
     } catch {
-      return false;
+      return false; // Fail securely if path parsing errors out
     }
-    return true;
   }
 
-  // Detects and blocks shell metacharacters and command execution attempts
+  // [FIXED] Detects shell metacharacters and command execution attempts, including newlines
   public validateCommand(command: string): boolean {
-    const metacharacters = /[|&;>$`()]/;
+    // Added \n and \r to prevent multi-line command injection
+    const metacharacters = /[|&;>$`()\n\r]/;
     if (metacharacters.test(command)) {
       return false;
     }
@@ -83,7 +81,7 @@ class SecurityEngine {
     return this.config.allowedCommands.includes(binary);
   }
 
-  // Detects and blocks Server-Side Request Forgery vectors
+  // [FIXED] Detects Server-Side Request Forgery vectors with expanded IP ranges
   public validateUrl(targetUrl: string): boolean {
     if (!targetUrl.includes('://')) {
       return true; // Parameter is not an absolute URL string
@@ -95,24 +93,23 @@ class SecurityEngine {
 
       if (this.config.blockPrivateIPs) {
         // Direct loopback and cloud metadata interface classifications
-        if (
-          host === 'localhost' ||
-          host === '127.0.0.1' ||
-          host === '0.0.0.0' ||
-          host === '169.254.169.254' ||
-          host === '::1'
-        ) {
+        if (host === 'localhost' || host === '::1' || host === '169.254.169.254') {
           return false;
         }
 
-        // Standard Class A, B, and C private network classifications
+        // Catch the entire 127.x.x.x loopback block, plus standard private ranges
         if (
+          host.startsWith('127.') || 
           host.startsWith('10.') ||
           host.startsWith('192.168.') ||
           /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host)
         ) {
           return false;
         }
+        
+        // Note: As a synchronous parser, this cannot block DNS Rebinding attacks 
+        // (e.g., evil.com resolving to 127.0.0.1). Advanced SSRF protection requires 
+        // async socket interception.
       }
     } catch {
       return false; // Reject malformed URL strings
@@ -120,32 +117,40 @@ class SecurityEngine {
     return true;
   }
 
-  // Recursively inspects unknown input schemas for validation anomalies
-  public inspectPayload(payload: any): { safe: boolean; reason?: string } {
+  // [FIXED] Recursively inspects unknown input schemas contextually to prevent false positives
+  public inspectPayload(payload: any, keyContext: string = ''): { safe: boolean; reason?: string } {
     if (!payload) return { safe: true };
 
     if (typeof payload === 'string') {
-      // Heuristic checks to classify the input string type
-      if (payload.includes('/') || payload.includes('\\') || payload.includes('..')) {
+      const lowerKey = keyContext.toLowerCase();
+
+      // Only check for path traversal if the parameter name implies it's a file/path,
+      // or if the payload explicitly starts with a file:// protocol.
+      const isPathContext = ['path', 'file', 'dir', 'folder', 'uri'].some(k => lowerKey.includes(k)) || payload.startsWith('file://');
+      if (isPathContext) {
         if (!this.validatePath(payload)) {
-          return { safe: false, reason: `Path traversal violation: "${payload}"` };
+          return { safe: false, reason: `Path traversal violation on field '${keyContext}': "${payload}"` };
         }
       }
 
-      if (/[|&;>$`()]/.test(payload)) {
+      // Only check for command injections if the parameter implies it's a system command
+      const isCommandContext = ['command', 'cmd', 'script', 'exec', 'args'].some(k => lowerKey.includes(k));
+      if (isCommandContext) {
         if (!this.validateCommand(payload)) {
-          return { safe: false, reason: `Command injection block: "${payload}"` };
+          return { safe: false, reason: `Command injection block on field '${keyContext}': "${payload}"` };
         }
       }
 
-      if (payload.includes('://')) {
+      // SSRF check applies to anything formatted as a web protocol URL
+      if (/^https?:\/\//i.test(payload)) {
         if (!this.validateUrl(payload)) {
-          return { safe: false, reason: `SSRF network boundary violation: "${payload}"` };
+          return { safe: false, reason: `SSRF network boundary violation on field '${keyContext}': "${payload}"` };
         }
       }
     } else if (typeof payload === 'object') {
       for (const key of Object.keys(payload)) {
-        const result = this.inspectPayload(payload[key]);
+        // Pass the key down recursively to maintain context
+        const result = this.inspectPayload(payload[key], key);
         if (!result.safe) {
           return result;
         }
@@ -180,15 +185,10 @@ class AuditLogger {
     }
   }
 
+  // [FIXED] Updated to use real SHA-256 via node:crypto
   private generateSignature(params: any): string {
     const serialized = JSON.stringify(params);
-    let hash = 0;
-    for (let i = 0; i < serialized.length; i++) {
-      const char = serialized.charCodeAt(i);
-      hash = (hash << 5) - hash + char;
-      hash |= 0;
-    }
-    return `sha32_${Math.abs(hash).toString(16)}`;
+    return createHash('sha256').update(serialized).digest('hex').substring(0, 16);
   }
 }
 
@@ -245,7 +245,6 @@ class SafeMcpGateway {
   }
 
   private spawnTargetServer(): void {
-    // Spawn the target server process under isolated environments without standard shell wrappers
     this.targetProcess = child_process.spawn(this.spawnCommand, this.spawnArgs, {
       stdio: ['pipe', 'pipe', 'inherit'],
       shell: false,
@@ -307,14 +306,13 @@ class SafeMcpGateway {
       return;
     }
 
-    // Check security policies for incoming tool calls
-    if (method === 'tools/call') {
-      const params = request.params || {};
-      const validation = this.securityEngine.inspectPayload(params);
+    // [FIXED] Run payload inspection on ALL methods that contain parameters, preventing resources/read bypasses
+    if (request.params && typeof request.params === 'object' && Object.keys(request.params).length > 0) {
+      const validation = this.securityEngine.inspectPayload(request.params);
 
       if (!validation.safe) {
         const blockReason = validation.reason || 'Security policy block';
-        this.auditLogger.log(method, false, blockReason, params);
+        this.auditLogger.log(method, false, blockReason, request.params);
         this.sendError(id, -32602, `Access Denied: ${blockReason}`);
         return;
       }
@@ -339,7 +337,6 @@ class SafeMcpGateway {
   }
 }
 
-// Main operational controller
 function main(): void {
   const args = process.argv.slice(2);
   const separatorIndex = args.indexOf('--');
